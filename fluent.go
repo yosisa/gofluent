@@ -1,6 +1,8 @@
 package fluent
 
 import (
+	"container/list"
+	"math"
 	"net"
 	"time"
 
@@ -18,11 +20,14 @@ func (f ErrorHandlerFunc) HandleError(err error) {
 }
 
 type Options struct {
-	SendBufSize  int
-	ErrorBufSize int
-	ErrorHandler ErrorHandler
-	DialTimeout  time.Duration
-	CloseTimeout time.Duration
+	Addr          string
+	SendBufSize   int
+	ErrorBufSize  int
+	ErrorHandler  ErrorHandler
+	DialTimeout   time.Duration
+	CloseTimeout  time.Duration
+	RetryInterval time.Duration
+	MaxBackoff    int
 }
 
 func (o *Options) Default() {
@@ -38,34 +43,40 @@ func (o *Options) Default() {
 	if o.CloseTimeout == 0 {
 		o.CloseTimeout = 5 * time.Second
 	}
+	if o.RetryInterval == 0 {
+		o.RetryInterval = 100 * time.Millisecond
+	}
+	if o.MaxBackoff == 0 {
+		o.MaxBackoff = 8
+	}
 }
 
 type Client struct {
-	conn         net.Conn
-	inputCh      chan interface{}
-	errorCh      chan error
-	closeCh      chan bool
-	errorHandler ErrorHandler
-	closeTimeout time.Duration
+	conn    net.Conn
+	inputCh chan interface{}
+	errorCh chan error
+	closeCh chan bool
+	opts    *Options
+	pending *list.List
 }
 
-func NewClient(addr string, opts Options) (*Client, error) {
+func NewClient(opts Options) (*Client, error) {
 	opts.Default()
 	c := &Client{
-		inputCh:      make(chan interface{}, opts.SendBufSize),
-		closeCh:      make(chan bool),
-		closeTimeout: opts.CloseTimeout,
+		opts:    &opts,
+		inputCh: make(chan interface{}, opts.SendBufSize),
+		closeCh: make(chan bool),
+		pending: list.New(),
 	}
 
-	conn, err := net.DialTimeout("tcp", addr, opts.DialTimeout)
+	conn, err := net.DialTimeout("tcp", c.opts.Addr, c.opts.DialTimeout)
 	if err != nil {
 		return nil, err
 	}
 	c.conn = conn
 
-	if opts.ErrorHandler != nil {
-		c.errorCh = make(chan error, opts.ErrorBufSize)
-		c.errorHandler = opts.ErrorHandler
+	if c.opts.ErrorHandler != nil {
+		c.errorCh = make(chan error, c.opts.ErrorBufSize)
 		go c.errorWorker()
 	}
 
@@ -84,7 +95,7 @@ func (c *Client) Close() {
 
 	select {
 	case <-c.closeCh:
-	case <-time.After(c.closeTimeout):
+	case <-time.After(c.opts.CloseTimeout):
 	}
 }
 
@@ -97,24 +108,66 @@ func (c *Client) worker() {
 		}
 	}()
 
-	var b []byte
 	for v := range c.inputCh {
+		var b []byte
 		if err := codec.NewEncoderBytes(&b, &codec.MsgpackHandle{}).Encode(v); err != nil {
 			c.pushError(err)
 			continue
 		}
 
 		if _, err := c.conn.Write(b); err != nil {
+			c.pending.PushBack(b)
 			c.pushError(err)
+			c.reconnect()
 		}
 	}
+}
+
+func (c *Client) reconnect() {
+	attempts := 0
+	retry := time.After(0)
+
+	for {
+		select {
+		case v, ok := <-c.inputCh:
+			if !ok {
+				return
+			}
+
+			var b []byte
+			if err := codec.NewEncoderBytes(&b, &codec.MsgpackHandle{}).Encode(v); err != nil {
+				c.pushError(err)
+				continue
+			}
+			c.pending.PushBack(b)
+		case <-retry:
+			if conn, err := net.DialTimeout("tcp", c.opts.Addr, c.opts.DialTimeout); err == nil {
+				c.conn = conn
+				if err := c.sendPending(); err == nil {
+					return
+				}
+			}
+			retry = time.After(backoff(c.opts.RetryInterval, attempts, c.opts.MaxBackoff))
+			attempts++
+		}
+	}
+}
+
+func (c *Client) sendPending() error {
+	for e := c.pending.Front(); e != nil; e = c.pending.Front() {
+		if _, err := c.conn.Write(e.Value.([]byte)); err != nil {
+			return err
+		}
+		c.pending.Remove(e)
+	}
+	return nil
 }
 
 func (c *Client) errorWorker() {
 	defer close(c.closeCh)
 
 	for err := range c.errorCh {
-		c.errorHandler.HandleError(err)
+		c.opts.ErrorHandler.HandleError(err)
 	}
 }
 
@@ -127,4 +180,11 @@ func (c *Client) pushError(err error) {
 	case c.errorCh <- err:
 	default:
 	}
+}
+
+func backoff(interval time.Duration, count, limit int) time.Duration {
+	if count > limit {
+		count = limit
+	}
+	return interval * time.Duration(math.Exp2(float64(count)))
 }
