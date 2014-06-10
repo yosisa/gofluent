@@ -2,6 +2,7 @@ package fluent
 
 import (
 	"container/list"
+	"io"
 	"math"
 	"net"
 	"time"
@@ -19,15 +20,47 @@ func (f ErrorHandlerFunc) HandleError(err error) {
 	f(err)
 }
 
+type pending struct {
+	list  *list.List
+	limit int
+}
+
+func newPending(limit int) *pending {
+	return &pending{
+		list:  list.New(),
+		limit: limit,
+	}
+}
+
+func (p *pending) Add(b []byte) {
+	// trim the pending if limit exceeded
+	for i := p.list.Len() - p.limit; i >= 0; i-- {
+		p.list.Remove(p.list.Front())
+	}
+
+	p.list.PushBack(b)
+}
+
+func (p *pending) Flush(w io.Writer) error {
+	for e := p.list.Front(); e != nil; e = p.list.Front() {
+		if _, err := w.Write(e.Value.([]byte)); err != nil {
+			return err
+		}
+		p.list.Remove(e)
+	}
+	return nil
+}
+
 type Options struct {
-	Addr          string
-	SendBufSize   int
-	ErrorBufSize  int
-	ErrorHandler  ErrorHandler
-	DialTimeout   time.Duration
-	CloseTimeout  time.Duration
-	RetryInterval time.Duration
-	MaxBackoff    int
+	Addr           string
+	SendBufSize    int
+	ErrorBufSize   int
+	ErrorHandler   ErrorHandler
+	DialTimeout    time.Duration
+	CloseTimeout   time.Duration
+	RetryInterval  time.Duration
+	MaxBackoff     int
+	MaxPendingSize int
 }
 
 func (o *Options) Default() {
@@ -49,6 +82,9 @@ func (o *Options) Default() {
 	if o.MaxBackoff == 0 {
 		o.MaxBackoff = 8
 	}
+	if o.MaxPendingSize == 0 {
+		o.MaxPendingSize = 1000 * 1000
+	}
 }
 
 type Client struct {
@@ -57,7 +93,7 @@ type Client struct {
 	errorCh chan error
 	closeCh chan bool
 	opts    *Options
-	pending *list.List
+	pending *pending
 }
 
 func NewClient(opts Options) (*Client, error) {
@@ -66,7 +102,7 @@ func NewClient(opts Options) (*Client, error) {
 		opts:    &opts,
 		inputCh: make(chan interface{}, opts.SendBufSize),
 		closeCh: make(chan bool),
-		pending: list.New(),
+		pending: newPending(opts.MaxPendingSize),
 	}
 
 	conn, err := net.DialTimeout("tcp", c.opts.Addr, c.opts.DialTimeout)
@@ -116,7 +152,7 @@ func (c *Client) worker() {
 		}
 
 		if _, err := c.conn.Write(b); err != nil {
-			c.pending.PushBack(b)
+			c.pending.Add(b)
 			c.pushError(err)
 			c.reconnect()
 		}
@@ -139,11 +175,11 @@ func (c *Client) reconnect() {
 				c.pushError(err)
 				continue
 			}
-			c.pending.PushBack(b)
+			c.pending.Add(b)
 		case <-retry:
 			if conn, err := net.DialTimeout("tcp", c.opts.Addr, c.opts.DialTimeout); err == nil {
-				c.conn = conn
-				if err := c.sendPending(); err == nil {
+				if err := c.pending.Flush(conn); err == nil {
+					c.conn = conn
 					return
 				}
 			}
@@ -151,16 +187,6 @@ func (c *Client) reconnect() {
 			attempts++
 		}
 	}
-}
-
-func (c *Client) sendPending() error {
-	for e := c.pending.Front(); e != nil; e = c.pending.Front() {
-		if _, err := c.conn.Write(e.Value.([]byte)); err != nil {
-			return err
-		}
-		c.pending.Remove(e)
-	}
-	return nil
 }
 
 func (c *Client) errorWorker() {
