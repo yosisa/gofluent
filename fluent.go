@@ -53,6 +53,7 @@ func (p *pending) Flush(w io.Writer) error {
 
 type Options struct {
 	Addr           string
+	TagPrefix      string
 	SendBufSize    int
 	ErrorBufSize   int
 	ErrorHandler   ErrorHandler
@@ -121,6 +122,14 @@ func NewClient(opts Options) (*Client, error) {
 }
 
 func (c *Client) Send(tag string, v interface{}) {
+	if c.opts.TagPrefix != "" {
+		if tag != "" {
+			tag = c.opts.TagPrefix + "." + tag
+		} else {
+			tag = c.opts.TagPrefix
+		}
+	}
+
 	now := time.Now().Unix()
 	val := []interface{}{tag, now, v}
 	c.inputCh <- val
