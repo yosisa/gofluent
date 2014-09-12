@@ -122,6 +122,10 @@ func NewClient(opts Options) (*Client, error) {
 }
 
 func (c *Client) Send(tag string, v interface{}) {
+	c.SendWithTime(tag, time.Now(), v)
+}
+
+func (c *Client) SendWithTime(tag string, t time.Time, v interface{}) {
 	if c.opts.TagPrefix != "" {
 		if tag != "" {
 			tag = c.opts.TagPrefix + "." + tag
@@ -130,8 +134,7 @@ func (c *Client) Send(tag string, v interface{}) {
 		}
 	}
 
-	now := time.Now().Unix()
-	val := []interface{}{tag, now, v}
+	val := []interface{}{tag, t.Unix(), v}
 	c.inputCh <- val
 }
 
