@@ -62,6 +62,7 @@ type Options struct {
 	RetryInterval  time.Duration
 	MaxBackoff     int
 	MaxPendingSize int
+	IsFluxion      bool
 }
 
 func (o *Options) Default() {
@@ -95,6 +96,7 @@ type Client struct {
 	closeCh chan bool
 	opts    *Options
 	pending *pending
+	mh      *codec.MsgpackHandle
 }
 
 func NewClient(opts Options) (*Client, error) {
@@ -104,6 +106,11 @@ func NewClient(opts Options) (*Client, error) {
 		inputCh: make(chan interface{}, opts.SendBufSize),
 		closeCh: make(chan bool),
 		pending: newPending(opts.MaxPendingSize),
+	}
+	if !opts.IsFluxion {
+		c.mh = &codec.MsgpackHandle{}
+	} else {
+		c.mh = &codec.MsgpackHandle{RawToString: true, WriteExt: true}
 	}
 
 	conn, err := net.DialTimeout("tcp", c.opts.Addr, c.opts.DialTimeout)
@@ -134,7 +141,14 @@ func (c *Client) SendWithTime(tag string, t time.Time, v interface{}) {
 		}
 	}
 
-	val := []interface{}{tag, t.Unix(), v}
+	var tt interface{}
+	if !c.opts.IsFluxion {
+		tt = t.Unix()
+	} else {
+		tt = t
+	}
+
+	val := []interface{}{tag, tt, v}
 	c.inputCh <- val
 }
 
@@ -158,11 +172,10 @@ func (c *Client) worker() {
 
 	for v := range c.inputCh {
 		var b []byte
-		if err := codec.NewEncoderBytes(&b, &codec.MsgpackHandle{}).Encode(v); err != nil {
+		if err := codec.NewEncoderBytes(&b, c.mh).Encode(v); err != nil {
 			c.pushError(err)
 			continue
 		}
-
 		if _, err := c.conn.Write(b); err != nil {
 			c.pending.Add(b)
 			c.pushError(err)
@@ -183,7 +196,7 @@ func (c *Client) reconnect() {
 			}
 
 			var b []byte
-			if err := codec.NewEncoderBytes(&b, &codec.MsgpackHandle{}).Encode(v); err != nil {
+			if err := codec.NewEncoderBytes(&b, c.mh).Encode(v); err != nil {
 				c.pushError(err)
 				continue
 			}
