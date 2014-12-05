@@ -129,7 +129,7 @@ type Client struct {
 	mh      *codec.MsgpackHandle
 }
 
-func NewClient(opts Options) (*Client, error) {
+func NewClient(opts Options) *Client {
 	opts.Default()
 	c := &Client{
 		opts:    &opts,
@@ -144,19 +144,13 @@ func NewClient(opts Options) (*Client, error) {
 		c.mh = &codec.MsgpackHandle{RawToString: true, WriteExt: true}
 	}
 
-	conn, err := net.DialTimeout("tcp", c.opts.Addr, c.opts.DialTimeout)
-	if err != nil {
-		return nil, err
-	}
-	c.conn = conn
-
 	if c.opts.ErrorHandler != nil {
 		c.errorCh = make(chan error, c.opts.ErrorBufSize)
 		go c.errorWorker()
 	}
 
 	go c.sender()
-	return c, nil
+	return c
 }
 
 // Send sends record v with given tag. v can be any type which can be encoded
@@ -211,6 +205,14 @@ func (c *Client) sender() {
 			close(c.closeCh)
 		}
 	}()
+
+	conn, err := net.DialTimeout("tcp", c.opts.Addr, c.opts.DialTimeout)
+	if err != nil {
+		c.pushError(err)
+		c.reconnect()
+	} else {
+		c.conn = conn
+	}
 
 	for v := range c.inputCh {
 		b, err := c.encode(v)
