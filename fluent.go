@@ -141,7 +141,8 @@ func NewClient(opts Options) *Client {
 	if !opts.IsFluxion {
 		c.mh = &codec.MsgpackHandle{}
 	} else {
-		c.mh = &codec.MsgpackHandle{RawToString: true, WriteExt: true}
+		c.mh = &codec.MsgpackHandle{WriteExt: true}
+		c.mh.RawToString = true
 	}
 
 	if c.opts.ErrorHandler != nil {
